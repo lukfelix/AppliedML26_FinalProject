@@ -5,7 +5,7 @@ This repository contains the group project created for the course "Applied Machi
 Our project revolves around the search for anomalies in the past data releases of the Zwicky Transient Facility.
 
 Contributors to the project are:\
-Sigrid Niessen\
+Sigrid Nissen\
 Konstantinos "Kostas" Plainos\
 and Lukas Felix
 
