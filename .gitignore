@@ -1,0 +1,9 @@
+*.pyc
+
+# not saving samples as the files get >10 MB, which unnecessarily slows download speed when cloning
+outputs/samples/*
+
+__pycache__/
+
+# to avoid getting environments in accidently
+myenv/
