@@ -1,9 +1,13 @@
 *.pyc
+.vscode/
 
-# not saving samples as the files get >10 MB, which unnecessarily slows download speed when cloning
-outputs/samples/*
+# put any output files that shouldn't be uploaded in a separate directory
+outputs/*
 
 __pycache__/
 
 # to avoid getting environments in accidently
 myenv/
+
+# ignore any WSL zone identifiers
+*Zone.Identifier

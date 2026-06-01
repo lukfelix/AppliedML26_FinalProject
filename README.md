@@ -2,7 +2,7 @@
 This repository contains the group project created for the course "Applied Machine Learning" in spring of 2026 at the University of Copenhagen.
 [Link to course information](https://www.nbi.dk/~petersen/Teaching/AppliedMachineLearning2026.html)
 
-Our project revolves around the search for anomalies in the past data releases of the Zwicky Transient Facility.
+Our project revolves around the search for anomalies in the past data releases of the [Zwicky Transient Facility](https://www.ztf.caltech.edu/).
 
 Contributors to the project are:\
 Sigrid Nissen\
