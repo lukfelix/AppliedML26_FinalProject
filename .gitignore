@@ -17,4 +17,4 @@ myenv/
 *.pt
 
 # the lightcurve data is too large to be uploaded, so we ignore it
-lightcurves.h5
+data/lightcurves.h5
