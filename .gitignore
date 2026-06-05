@@ -15,3 +15,6 @@ myenv/
 
 # not storing weights of saved models
 *.pt
+
+# the lightcurve data is too large to be uploaded, so we ignore it
+lightcurves.h5
