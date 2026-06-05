@@ -11,3 +11,7 @@ myenv/
 
 # ignore any WSL zone identifiers
 *Zone.Identifier
+.DS_Store
+
+# not storing weights of saved models
+*.pt
