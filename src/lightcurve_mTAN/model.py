@@ -255,9 +255,17 @@ class mTANDecoder(nn.Module):
 
         self.norm    = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
+        # Projects filter one-hot (dim=2) into d_model so the decoder
+        # can produce different outputs for g vs r at the same time
+        self.filter_inject = nn.Linear(2, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, 2)        # → magpsf, sigmapsf
 
-    def forward(self, z: torch.Tensor, query_times: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        z:            torch.Tensor,   # (B, d_latent)
+        query_times:  torch.Tensor,   # (B, T)
+        filter_onehot: torch.Tensor,  # (B, T, 2)  — which filter each obs belongs to
+    ) -> torch.Tensor:
         B, T = query_times.shape
 
         # Expand latent to reference representations
@@ -271,7 +279,12 @@ class mTANDecoder(nn.Module):
             out = layer(query_times, ref, ref_vals)                    # (B, T, d_model)
             ref_vals_q = self.norm(out)
 
-        return self.out_proj(ref_vals_q)                               # (B, T, 2)
+        # Inject filter identity into the per-observation representation
+        # before the final projection, so the output can differ by band
+        filter_proj = self.filter_inject(filter_onehot)                # (B, T, d_model)
+        combined    = ref_vals_q + filter_proj                         # (B, T, d_model)
+
+        return self.out_proj(combined)                                 # (B, T, 2)
 
 
 # ── Full Autoencoder ──────────────────────────────────────────────────────────
@@ -304,9 +317,10 @@ class mTANAutoencoder(nn.Module):
             recon: (B, T, 2)   reconstructed [magpsf, sigmapsf]
             z:     (B, d_latent)
         """
-        z     = self.encoder(x, mask)
-        times = x[:, :, 0]                           # (B, T)
-        recon = self.decoder(z, times)
+        z            = self.encoder(x, mask)
+        times        = x[:, :, 0]                    # (B, T)
+        filter_onehot = x[:, :, 3:5]                # (B, T, 2)  — is_g, is_r
+        recon        = self.decoder(z, times, filter_onehot)
         return recon, z
 
     def encode(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -317,29 +331,48 @@ class mTANAutoencoder(nn.Module):
 # ── Loss ──────────────────────────────────────────────────────────────────────
 
 def masked_chi2_loss(
-    recon:  torch.Tensor,   # (B, T, 2)  predicted [mag, sig]
-    target: torch.Tensor,   # (B, T, 2)  true      [mag, sig]  (normalised)
-    mask:   torch.Tensor,   # (B, T)     bool
-    eps:    float = 1e-4,
+    recon:       torch.Tensor,   # (B, T, 2)  predicted [mag, sig]
+    target:      torch.Tensor,   # (B, T, 2)  true      [mag, sig]  (normalised)
+    mask:        torch.Tensor,   # (B, T)     bool
+    alpha:       float = 0.5,    # weight of plain MSE term (0=pure chi2, 1=pure MSE)
+    beta:        float = 0.1,    # weight of derivative loss term
+    eps:         float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Inverse-variance weighted MSE on magpsf only (col 0).
-    sigmapsf (col 1) is reconstructed but not used in the χ² weight
-    to avoid the model gaming the loss by predicting large uncertainties.
+    Mixed loss: alpha*MSE + (1-alpha)*chi2 + beta*derivative_MSE.
+
+    The derivative term penalises differences in local slope between adjacent
+    observations, directly incentivising the model to learn variability patterns
+    rather than collapsing to a smooth mean trend.
 
     Returns:
         loss:              scalar — mean over all valid observations
         per_object_loss:   (B,)   — mean loss per object (for anomaly scoring)
     """
-    mag_pred = recon[..., 0]                         # (B, T)
+    mag_pred = recon[..., 0]                                   # (B, T)
     mag_true = target[..., 0]
-    sig_true = target[..., 1].abs() + eps            # normalised sigmapsf, keep positive
+    # sig_true is now a genuine positive uncertainty (normalised by mag_std
+    # in the dataset), so we only need a floor to avoid div-by-zero — not the
+    # old abs() hack that masked the broken z-scored sigma.
+    sig_true = target[..., 1].clamp(min=eps)
 
-    residual = (mag_pred - mag_true) ** 2 / sig_true ** 2   # (B, T)
-    residual = residual * mask                               # zero out padding
+    mse_res  = (mag_pred - mag_true) ** 2                      # (B, T)
+    chi2_res = mse_res / (sig_true ** 2)
 
-    n_valid          = mask.sum(dim=1).clamp(min=1)          # (B,)
-    per_object_loss  = residual.sum(dim=1) / n_valid         # (B,)
-    loss             = per_object_loss.mean()
+    point_loss = (alpha * mse_res + (1.0 - alpha) * chi2_res) * mask
+
+    # Derivative loss: compare consecutive differences
+    # Only valid where both adjacent observations are real
+    adj_mask   = mask[:, :-1] & mask[:, 1:]                   # (B, T-1)
+    d_pred     = (mag_pred[:, 1:] - mag_pred[:, :-1]) * adj_mask
+    d_true     = (mag_true[:, 1:] - mag_true[:, :-1]) * adj_mask
+    deriv_loss = (d_pred - d_true) ** 2 * adj_mask            # (B, T-1)
+
+    n_valid         = mask.sum(dim=1).clamp(min=1)             # (B,)
+    n_adj           = adj_mask.sum(dim=1).clamp(min=1)         # (B,)
+
+    per_object_loss = (point_loss.sum(dim=1) / n_valid
+                       + beta * deriv_loss.sum(dim=1) / n_adj)
+    loss            = per_object_loss.mean()
 
     return loss, per_object_loss

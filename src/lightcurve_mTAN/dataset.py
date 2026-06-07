@@ -46,9 +46,15 @@ class NormStats:
         self._s = stats
 
     def normalise(self, band: str, magpsf: np.ndarray, sigmapsf: np.ndarray):
-        ms = self._s[band]
-        mag_n = (magpsf   - ms["magpsf"]["mean"])   / ms["magpsf"]["std"]
-        sig_n = (sigmapsf - ms["sigmapsf"]["mean"]) / ms["sigmapsf"]["std"]
+        ms       = self._s[band]
+        mag_std  = ms["magpsf"]["std"]
+        mag_n    = (magpsf - ms["magpsf"]["mean"]) / mag_std
+        # sigmapsf is a photometric error bar: a positive scale on magpsf.
+        # It must be normalised by the SAME scale as magpsf (no mean
+        # subtraction) so that (mag_pred - mag_true) / sig_n is a proper
+        # standardised residual. Z-scoring it independently (old behaviour)
+        # let it go negative/zero and broke the chi2 denominator.
+        sig_n    = sigmapsf / mag_std
         return mag_n.astype(np.float32), sig_n.astype(np.float32)
 
     def save(self, path: Path) -> None:

@@ -70,26 +70,40 @@ def load_model(run: Path, checkpoint: str, device: torch.device) -> tuple:
 
 # ── Score distribution ────────────────────────────────────────────────────────
 
-def plot_score_distribution(scores: np.ndarray, out: Path) -> None:
+def plot_score_distribution(scores: np.ndarray, scores_norm: np.ndarray, out: Path) -> None:
     """
-    Histogram of anomaly scores on a log-count y-axis.
-    Anomalies should appear as a sparse tail on the right.
-    A vertical line marks the 95th and 99th percentiles.
+    Two panels: raw score distribution (log x) and length-normalised percentile score.
     """
-    p95 = np.percentile(scores, 95)
-    p99 = np.percentile(scores, 99)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.hist(scores, bins=100, color="#607D8B", alpha=0.8, log=True)
+    # Left: raw scores, log x-axis
+    ax = axes[0]
+    pos = scores[scores > 0]
+    ax.hist(np.log10(pos), bins=80, color="#607D8B", alpha=0.8, log=True)
+    p95 = np.percentile(np.log10(pos), 95)
+    p99 = np.percentile(np.log10(pos), 99)
     ax.axvline(p95, color="#FF9800", linewidth=1.5, linestyle="--",
-               label=f"95th pct ({p95:.3f})")
+               label=f"95th pct (10^{p95:.2f})")
     ax.axvline(p99, color="#F44336", linewidth=1.5, linestyle="--",
-               label=f"99th pct ({p99:.3f})")
-    ax.set_xlabel("Anomaly score (reconstruction loss)")
+               label=f"99th pct (10^{p99:.2f})")
+    ax.set_xlabel("log₁₀(anomaly score)")
     ax.set_ylabel("Count (log scale)")
-    ax.set_title("Anomaly Score Distribution")
-    ax.legend()
+    ax.set_title("Raw Score Distribution")
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.25, which="both")
+
+    # Right: normalised percentile score
+    ax = axes[1]
+    ax.hist(scores_norm, bins=50, color="#5C6BC0", alpha=0.8, log=True)
+    ax.axvline(95, color="#FF9800", linewidth=1.5, linestyle="--", label="95th pct")
+    ax.axvline(99, color="#F44336", linewidth=1.5, linestyle="--", label="99th pct")
+    ax.set_xlabel("Length-normalised score (percentile within length bin)")
+    ax.set_ylabel("Count (log scale)")
+    ax.set_title("Normalised Score Distribution")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.25, which="both")
+
+    fig.suptitle("Anomaly Score Distributions", fontsize=12)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close(fig)
@@ -98,28 +112,41 @@ def plot_score_distribution(scores: np.ndarray, out: Path) -> None:
 
 # ── Score vs number of observations ──────────────────────────────────────────
 
-def plot_score_vs_nobs(scores: np.ndarray, n_obs: np.ndarray, out: Path) -> None:
+def plot_score_vs_nobs(
+    scores: np.ndarray,
+    scores_norm: np.ndarray,
+    n_obs: np.ndarray,
+    out: Path,
+) -> None:
     """
-    Sanity check: high scores should not simply correlate with low observation
-    counts (which would indicate the model just fails on sparse data rather
-    than finding genuine astrophysical anomalies).
+    Two panels: raw score vs n_obs (both log), and normalised score vs n_obs.
+    After normalisation the top anomalies should be distributed across all
+    sequence lengths, not concentrated at short sequences.
     """
-    p99 = np.percentile(scores, 99)
-    is_top = scores >= p99
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
 
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.scatter(n_obs[~is_top], scores[~is_top],
-               s=3, alpha=0.3, color="#607D8B", linewidths=0,
-               label="Normal (< 99th pct)")
-    ax.scatter(n_obs[is_top], scores[is_top],
-               s=12, alpha=0.8, color="#F44336", linewidths=0,
-               label="Top 1% anomalies")
+    is_top_raw  = scores      >= np.percentile(scores,      99)
+    is_top_norm = scores_norm >= np.percentile(scores_norm, 99)
 
-    ax.set_xlabel("Number of observations")
-    ax.set_ylabel("Anomaly score")
-    ax.set_title("Anomaly Score vs Sequence Length")
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.25)
+    for ax, sc, is_top, label, title in [
+        (axes[0], scores,      is_top_raw,  "log₁₀(raw score)",        "Raw Score vs Length"),
+        (axes[1], scores_norm, is_top_norm, "Normalised score (pctile)", "Normalised Score vs Length"),
+    ]:
+        yvals = np.log10(np.maximum(sc, 1e-6)) if label.startswith("log") else sc
+        ax.scatter(n_obs[~is_top], yvals[~is_top],
+                   s=3, alpha=0.25, color="#607D8B", linewidths=0,
+                   label="Normal (< 99th pct)")
+        ax.scatter(n_obs[is_top], yvals[is_top],
+                   s=14, alpha=0.85, color="#F44336", linewidths=0,
+                   label="Top 1% anomalies")
+        ax.set_xscale("log")
+        ax.set_xlabel("Number of observations (log)")
+        ax.set_ylabel(label)
+        ax.set_title(title)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.25, which="both")
+
+    fig.suptitle("Anomaly Score vs Sequence Length", fontsize=12)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close(fig)
@@ -226,17 +253,22 @@ def main() -> None:
               f"Run score_anomalies.py first.")
         return
 
-    scores_df = pd.read_csv(scores_path)
-    scores    = scores_df["score"].to_numpy()
-    n_obs     = scores_df["n_obs"].to_numpy()
+    scores_df   = pd.read_csv(scores_path)
+    scores      = scores_df["score"].to_numpy()
+    n_obs       = scores_df["n_obs"].to_numpy()
+    # score_norm column may be absent in older runs; fall back to raw score
+    scores_norm = (scores_df["score_norm"].to_numpy()
+                   if "score_norm" in scores_df.columns
+                   else scores.copy())
 
     print(f"Loaded scores for {len(scores_df)} objects.")
-    print(f"  Score range: [{scores.min():.4f}, {scores.max():.4f}]  "
+    print(f"  Raw score range:  [{scores.min():.4f}, {scores.max():.4f}]  "
           f"median={np.median(scores):.4f}")
+    print(f"  Norm score range: [{scores_norm.min():.1f}, {scores_norm.max():.1f}]")
 
-    plot_score_distribution(scores,
+    plot_score_distribution(scores, scores_norm,
                             out=args.run / "plot_score_distribution.png")
-    plot_score_vs_nobs(scores, n_obs,
+    plot_score_vs_nobs(scores, scores_norm, n_obs,
                        out=args.run / "plot_score_vs_nobs.png")
 
     # Top-N lightcurves need the model and dataset

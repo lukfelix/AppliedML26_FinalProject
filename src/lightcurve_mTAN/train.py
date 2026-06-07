@@ -46,11 +46,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--d_model",   type=int,   default=64)
     p.add_argument("--d_time",    type=int,   default=16)
     p.add_argument("--d_latent",  type=int,   default=64)
-    p.add_argument("--n_ref",     type=int,   default=64,
+    p.add_argument("--n_ref",     type=int,   default=128,
                    help="Number of reference time points in mTAN")
     p.add_argument("--n_heads",   type=int,   default=4)
     p.add_argument("--n_layers",  type=int,   default=2)
     p.add_argument("--dropout",   type=float, default=0.1)
+    p.add_argument("--alpha",     type=float, default=0.5,
+                   help="Loss mix: 0=pure chi2, 1=pure MSE (default 0.5)")
+    p.add_argument("--beta",      type=float, default=0.1,
+                   help="Weight of derivative loss term (default 0.1)")
 
     # Training
     p.add_argument("--epochs",        type=int,   default=100)
@@ -74,6 +78,8 @@ def run_epoch(
     optimizer: torch.optim.Optimizer,
     device:    torch.device,
     train:     bool,
+    alpha:     float = 0.5,
+    beta:      float = 0.1,
 ) -> float:
     model.train(train)
     total_loss = 0.0
@@ -87,7 +93,7 @@ def run_epoch(
             mask   = batch["mask"].to(device)
 
             recon, _ = model(x, mask)
-            loss, _  = masked_chi2_loss(recon, target, mask)
+            loss, _  = masked_chi2_loss(recon, target, mask, alpha=alpha, beta=beta)
 
             if train:
                 optimizer.zero_grad()
@@ -169,8 +175,8 @@ def main() -> None:
         for epoch in range(1, args.epochs + 1):
             t0 = time.time()
 
-            train_loss = run_epoch(model, train_dl, optimizer, device, train=True)
-            val_loss   = run_epoch(model, val_dl,   optimizer, device, train=False)
+            train_loss = run_epoch(model, train_dl, optimizer, device, train=True,  alpha=args.alpha, beta=args.beta)
+            val_loss   = run_epoch(model, val_dl,   optimizer, device, train=False, alpha=args.alpha, beta=args.beta)
             scheduler.step(val_loss)
 
             elapsed = time.time() - t0
