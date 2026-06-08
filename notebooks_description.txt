@@ -1,0 +1,324 @@
+================================================================================
+DESCRIPTION OF ANOMALY DETECTION NOTEBOOKS
+AppliedML2026 Final Project — Konstantinos Plainos
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+1. FinalSubmissionSmall.ipynb
+   Generator: generate_submission_small.py
+────────────────────────────────────────────────────────────────────────────────
+
+PURPOSE
+-------
+A lean, self-contained anomaly detection code applied to the full ZTF
+photometric transient dataset (16,338 objects, 51 columns). It identifies
+objects that are "unlike normal" using an autoencoder trained exclusively on
+well-understood transient classes. 
+
+
+DATASET
+-------
+Source: data.csv — ZTF photometric summary statistics. Each row is one
+transient alert. Columns include light-curve shape parameters (rise/fall rates,
+peak magnitudes, colour index), host-galaxy proximity, and class labels.
+
+Classes in the full dataset:
+  SN      — 10,636  (supernova; dominant class)
+  NT      —  1,781  (nuclear transient)
+  AGN     —  1,532  (active galactic nucleus)
+  VS      —  1,486  (variable star)
+  ORPHAN  —    520  (host-less transient; no reference galaxy detected)
+  UNCLEAR —    255  (dropped: classificationReliability = 3.0)
+  CV      —     66  (dropped: too few objects)
+  BS      —     62  (dropped: bright-star artefact, not a real transient)
+
+After dropping BS, CV, UNCLEAR: 15,955 objects remain.
+
+Role split:
+  Normal (AE training pool): SN + AGN + VS  (~13,654 objects)
+  Evaluation only:           NT + ORPHAN    (~2,301 objects)
+
+NT and ORPHAN are excluded from training — not because they are assumed to be
+the only anomalies, but because their labels are weaker (NT = uncertain nuclear
+activity, ORPHAN = no confirmed host) and including them would teach the AE to
+reconstruct them, suppressing their scores. They serve as a *validation check*:
+if the AE is working, objects with unusual photometric properties should score
+high regardless of their label.
+
+In practice the anomaly detector flags anything with high reconstruction error.
+The top-20 list is dominated by labelled SNe — unusual subtypes (SN IIn, SN Ic,
+peculiar ones) that look unlike the bulk of the SN training population. NT and
+ORPHAN happening to score high is the validation that the method is physically
+meaningful, not a definition of what counts as anomalous.
+
+
+STEP 1 — FEATURE SELECTION (correlation-based, automatic)
+-----------------------------------------------------------
+Rather than hand-picking features, the pipeline uses a data-driven approach:
+
+  a) Start from all numeric columns, excluding:
+       - Label/target columns (classification, classificationReliability,
+         tns_type, tns_name, host_name)
+       - Catalogue identifiers (objectId, htm16, ssnamenr)
+       - Absolute Julian Date timestamps (jdgmax, jdrmax, jdmax, jdmin,
+         jd_g_minus_r) — these encode *when* an object was observed, not
+         its intrinsic photometric properties
+       - Absolute sky coordinates (ramean, decmean, glatmean, glonmean) —
+         these reflect survey geometry, not transient physics
+     This leaves ~34 candidate numeric features.
+
+  b) Winsorise all candidates at the 1st/99th percentile to suppress extreme
+     photometric outliers (e.g. mag_g02 values of ±2 million caused by bad
+     photometry on faint sources).
+
+  c) Median-impute all remaining NaN values (including z/redshift at 69% null
+     and distance at 21% null — previously excluded by hand, now kept and
+     imputed like any other feature).
+
+  d) Compute the full Pearson correlation matrix and drop one column from
+     every pair with |r| > 0.90. Highly correlated features are redundant;
+     keeping one from each pair reduces noise without losing information.
+     In practice this drops: maggmin, magrmin (near-perfect correlates of
+     the max-magnitude columns).
+
+  Result: 32 retained features (FEATURE_COLS), determined at runtime.
+
+  e) Re-apply winsorisation and median imputation to the 32 retained features,
+     then z-score scale with StandardScaler. This produces X_scaled (shape
+     15,955 × 32), the input to both k-means and the autoencoder.
+
+
+STEP 2 — AUTOENCODER ARCHITECTURE
+-----------------------------------
+A symmetric fully-connected autoencoder:
+
+  Encoder: 32 → 1024 → 512 → 256 → 128 → 8   (latent dimension)
+  Decoder:  8 → 128  → 256 → 512 → 1024 → 32
+
+  Each hidden layer uses ReLU activation. No dropout or batch normalisation.
+  Loss: MSELoss (mean squared error between input and reconstruction).
+  Optimiser: Adam, learning rate 1e-3.
+
+Architecture was selected by a 13-configuration hyperparameter sweep
+(see sweep.py). This configuration gave the highest ORPHAN detection rate
+(~82% above p90 in the biased single-model version; ~39% in the honest
+5-fold OOF version).
+
+The input dimension (32) is determined automatically at runtime from
+FEATURE_COLS, so the architecture adapts if the correlation filter retains
+a different number of features.
+
+
+STEP 3 — 5-FOLD CROSS-VALIDATED TRAINING
+------------------------------------------
+Training uses only the 13,654 normal objects (SN + AGN + VS).
+
+KFold(n_splits=5, shuffle=True, random_state=42) divides the normal pool
+into 5 equal partitions (~2,731 objects each).
+
+For each fold k (k = 1..5):
+  - Train a fresh AutoEncoder on the other 4 partitions (80%, ~10,923 objects)
+    for 200 epochs with batch size 256.
+  - Score the held-out 20% (~2,731 objects) immediately after training.
+    These are the out-of-fold (OOF) reconstruction errors for that partition.
+  - Store the trained model (fold_models[k]).
+
+After all 5 folds:
+  - Every normal object has exactly one OOF score — produced by a model that
+    never trained on it. This is the most honest possible anomaly score for
+    the normal population.
+  - The 5 trained models are all kept for scoring rare objects.
+
+Hyperparameters:
+  EPOCHS     = 200  (loss converges by ~epoch 50; 200 ensures stability)
+  BATCH_SIZE = 256
+  LR         = 1e-3 (Adam default; well-suited for tabular data)
+  N_FOLDS    = 5
+
+
+STEP 4 — ANOMALY SCORING
+--------------------------
+All 15,955 objects are passed through all 5 fold models.
+
+  Normal objects (SN, AGN, VS):
+    Anomaly score = OOF reconstruction error (from the one fold that held
+    them out). This score is unbiased — the model never saw this object.
+
+  Rare objects (NT, ORPHAN):
+    Anomaly score = mean reconstruction error across all 5 fold models.
+    These objects were never in any training fold, so all 5 models are
+    equally valid scorers.
+
+  Anomaly score formula (per-sample MSE):
+    score_i = (1/d) * sum_j (x_ij - x_hat_ij)^2
+    where d=32 is the number of features and x_hat is the reconstruction.
+
+  Threshold: 90th percentile of all 15,955 anomaly scores (~0.256).
+  Exactly 10% of all objects fall above this threshold by construction.
+
+
+STEP 5 — RESULTS
+-----------------
+  Class    n       % above p90 threshold
+  -------  ------  ----------------------
+  SN       10,636   10.1%  (training class — baseline)
+  AGN       1,532    6.0%  (training class)
+  VS        1,486    8.3%  (training class)
+  NT        1,781    5.6%  (evaluation only)
+  ORPHAN      520   39.0%  (evaluation only — 4× the SN baseline)
+
+TNS rare-type breakdown (spectroscopically confirmed):
+  TDE          46 objects   8.7% above p90
+  SLSN-I       40 objects  30.0% above p90
+  SLSN-II      20 objects  15.0% above p90
+  SN Ia-pec    21 objects   0.0% above p90
+
+The 39% ORPHAN rate confirms the AE has learned to distinguish host-less
+transients from normal ones based on photometric features alone. SLSN-I
+objects (superluminous supernovae, 10-100× brighter than normal SNe) also
+score anomalously high, consistent with their unusual photometric properties.
+
+The OOF methodology gives honest scores: the 77.7% ORPHAN rate seen in
+earlier single-model versions was inflated because normal objects were scored
+in-sample (on data the model had trained on), artificially lowering the
+threshold. The 5-fold OOF approach corrects this.
+
+
+STEP 6 — VISUALISATIONS
+------------------------
+  - 5-fold loss curves: train and validation MSE per epoch for all 5 folds.
+    All folds converge to val MSE ~0.11 by epoch ~50.
+  - p90 table: fraction of each class above the anomaly threshold.
+  - TNS rare-type table: median error and % above threshold for known rare types.
+  - Top 20 anomaly list: highest-scoring objects with class, score, and TNS type.
+  - Lightcurves: g/r/i photometry (mag vs days since first observation) for
+    the top 12 anomalies, loaded from the per-object CSV files in
+    ../lightcurves/AppML_lcs/.
+  - Latent-space UMAP: 2D projection of the 8-dimensional encoder output.
+    Left panel coloured by true class; right panel coloured by log(1 + error).
+    Anomalous objects appear at the periphery of the learned manifold.
+
+
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+2. FinalTnsOnly.ipynb
+   Generator: generate_submission_tns.py
+────────────────────────────────────────────────────────────────────────────────
+
+PURPOSE
+-------
+An identical pipeline to FinalSubmissionSmall.ipynb, but restricted to the
+5,198 objects that have a spectroscopic classification from the Transient Name
+Server (TNS). Because every object in this dataset has a confirmed type,
+the validation is direct and rigorous: known rare types (TDE, SLSN, SN Ic-BL,
+SN Ibn, etc.) can be checked against the anomaly score without relying on the
+weaker photometric ZTF class labels.
+
+
+DATASET
+-------
+The TNS filter is applied immediately after loading:
+
+  df = df[df["tns_type"].notna()].copy()
+
+This retains 5,198 of the original 16,338 objects (~32%).
+
+After dropping BS, CV, UNCLEAR: ~5,100 objects remain.
+
+Class breakdown (TNS-confirmed only):
+  SN      — 4,068  (training class; includes SN Ia, SN II, SN Ib/c, etc.)
+  NT      —   635  (evaluation only)
+  VS      —   207  (training class)
+  ORPHAN  —   135  (evaluation only)
+  AGN     —    53  (training class; very few — noisier estimates)
+
+Normal training pool: SN + AGN + VS  (~4,328 objects)
+Evaluation only:      NT + ORPHAN    (~770 objects)
+
+
+DIFFERENCES FROM FinalSubmissionSmall.ipynb
+--------------------------------------------
+  1. Dataset size: 5,100 vs 15,955 objects.
+  2. Training pool: ~4,328 vs ~13,654 normal objects.
+  3. All objects have confirmed TNS types — no NaN in tns_type.
+  4. TNS rare-type table is expanded to include more confirmed types:
+       TDE, SLSN-I, SLSN-II, SN Ia-pec, SN Ic-BL, SN Ibn,
+       SN Ia-91T-like, SN Ia-91bg-like, Nova.
+  5. Conclusions section discusses results in terms of confirmed types rather
+     than photometric class labels.
+
+Everything else — feature selection, AE architecture, 5-fold CV, OOF scoring,
+threshold calculation, lightcurve plots, latent UMAP — is identical.
+
+
+STEP 1–3 (identical to FinalSubmissionSmall)
+---------------------------------------------
+Feature selection, preprocessing, and AE architecture are unchanged.
+The correlation filter runs on the TNS-only subset and may retain a slightly
+different feature set (still ~32 features) since the correlation structure
+changes with a smaller, more homogeneous dataset.
+
+Training uses the same hyperparameters:
+  EPOCHS=200, BATCH_SIZE=256, LR=1e-3, N_FOLDS=5, LATENT_DIM=8
+
+
+STEP 4 — RESULTS
+-----------------
+  Class    n      % above p90 threshold
+  -------  -----  ----------------------
+  SN       4,068   9.5%  (training class — baseline)
+  AGN         53  24.5%  (training class — only 53 objects, high variance)
+  VS         207   8.2%  (training class)
+  NT         635   7.7%  (evaluation only)
+  ORPHAN     135  33.3%  (evaluation only — 3.5× the SN baseline)
+
+TNS rare-type breakdown:
+  SLSN-I          40 objects  35.0% above p90  (strongest anomaly signal)
+  SLSN-II         20 objects  15.0% above p90
+  SN Ibn          20 objects  15.0% above p90
+  SN Ia-91bg-like 21 objects  14.3% above p90
+  SN Ic-BL        37 objects  10.8% above p90
+  TDE             46 objects   8.7% above p90
+  SN Ia-91T-like 114 objects   6.1% above p90
+  SN Ia-pec       21 objects   0.0% above p90
+
+Notable differences vs the full-dataset version:
+  - The p90 threshold is higher (0.453 vs 0.256) because the training pool
+    is smaller and more homogeneous (mostly SN Ia), producing stronger
+    compression pressure and higher baseline errors.
+  - AGN rate (24.5%) is unreliable due to only 53 TNS-confirmed AGN.
+  - TDE rate drops from the full-dataset estimate because the higher
+    threshold makes them harder to flag.
+  - SLSN-I remains the clearest confirmed anomaly at 35%.
+  - ORPHAN rate (33.3%) is slightly lower than the full dataset (39%) because
+    the TNS-confirmed ORPHAN subset (135 objects) may be a biased sample
+    of the 520 total ORPHANs.
+
+
+WHY TWO NOTEBOOKS?
+------------------
+FinalSubmissionSmall uses all available data (15,955 objects), which gives:
+  - A larger, more diverse training pool → more robust reconstruction baseline
+  - More ORPHAN and NT objects for evaluation → more statistically reliable
+    anomaly rates
+  - Some label noise (photometric classifications, not spectroscopic)
+
+FinalTnsOnly uses only spectroscopically confirmed objects (5,198), which gives:
+  - Ground-truth labels for every object → rigorous validation against known
+    rare types
+  - A smaller, purer training set (mostly SN Ia) → higher compression pressure
+    but also less coverage of normal diversity
+  - Direct measurement of anomaly rates for specific rare classes (TDE, SLSN, etc.)
+
+The two together provide complementary evidence: the full-dataset version shows
+that the AE detects unusual objects in a realistic deployment scenario; the
+TNS-only version shows that the anomaly scores correlate with known physical
+rarity confirmed by spectroscopy.
+
+
+================================================================================
+Generated: 2026-06-08
+================================================================================
